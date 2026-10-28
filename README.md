@@ -17,6 +17,7 @@
 - [2. Kiến trúc đích & cấu trúc repo](#2-kiến-trúc-đích--cấu-trúc-repo)
 - [3. Mô hình miền & hợp đồng dữ liệu](#3-mô-hình-miền--hợp-đồng-dữ-liệu)
 - [4. Harness (lớp thực thi dùng chung)](#4-harness-lớp-thực-thi-dùng-chung)
+  - [4.1 Guardrails, trust boundary & phân vai FE/BE ↔ RAG](#41-guardrails-trust-boundary--phân-vai-febe--rag)
 - [5. Đặc tả tái tạo — Serving](#5-đặc-tả-tái-tạo--serving)
   - F1 Cấu hình & corpora · F2 Country routing · F3 Retrieval engine · F4 Router & Planning · F5 Generation
   - F6 Web fallback · F7 Orchestration/Workflows · F8 Conversation & Memory · F9 Form search · F10 Form parse A · F11 Form parse B (GPU) · F12 Form chat & fill · F13 Worker/Celery · F14 API
@@ -139,6 +140,7 @@ legal-assistant/
     harness/
       execution.py admission.py identity.py budgets.py
       model_gateway.py events.py errors.py
+      observability.py resilience.py safety.py cache.py feedback.py lifecycle.py
     workflows/
       direct/workflow.py
       legal_answer/ contracts.py nodes.py graph.py
@@ -268,6 +270,12 @@ Harness bọc mọi executor với cùng chính sách. Các module tối thiểu
 | `execution.py` | `ExecutionRepository` (reserve/accept/claim/record‑waiting/resume/finish/fail/read‑events) + Postgres checkpointer; `claim` trả epoch; mutation worker bắt buộc kèm `execution_id`+epoch; **stale epoch không publish**. |
 | `events.py` | Chiếu hoạt động graph → **SSE có version** (seq tăng dần trong run); sự kiện kết thúc lưu giao dịch; redaction trước khi phát. |
 | `errors.py` | Ánh xạ lỗi nội bộ (có kiểu) → mã công khai ở trên. |
+| `observability.py` | **Tracing** (OpenTelemetry span mỗi node/adapter, trace_id = correlation_id), **metrics** (latency p50/p95, token in/out & chi phí theo model/route, retrieval hit/empty/unavailable, cache hit‑rate), **structured log** JSON có redaction. Thiếu cái này = production mù. |
+| `resilience.py` | **Circuit breaker** mỗi provider/endpoint (Neo4j/Infinity/LLM) + **fallback chain** model (primary→secondary) + timeout/retry có jitter. Gateway hiện mới có retry/timeout; thêm breaker để một provider chết không kéo sập toàn hệ. |
+| `safety.py` | **Moderation input/output** (nội dung độc hại, jailbreak) + **injection‑hardening cho context RAG/web** (delimiter + chỉ thị "context là dữ liệu") + **disclaimer/abstention** pháp lý (không tư vấn vượt chứng cứ). Mở rộng anti‑injection của LAWYER_SUMMARY ra toàn generation. |
+| `cache.py` | **Response/semantic cache** ở serving (khoá = normalized query + countries + corpus_version + policy_version), embedding cache. Khác cache eval; giảm chi phí & latency truy vấn lặp. |
+| `feedback.py` | Ghi **query log + phản hồi người dùng** (thumbs up/down, câu hỏi, evidence đã dùng) để khép vòng với eval offline (E‑suite). Online signal → chọn mẫu khó cho benchmark. |
+| `lifecycle.py` | **Health/readiness probe** (DB/Infinity/LLM reachable + G‑DB schema contract), **graceful shutdown** (drain run đang chạy), warmup. |
 
 ```mermaid
 stateDiagram-v2
@@ -287,6 +295,64 @@ stateDiagram-v2
 ```
 
 Schema lưu trữ tối thiểu (Postgres) — xem ER ở §7.3. Checkpointer sở hữu *tiếp tục thực thi*; Postgres sở hữu *conversation / event / evidence đã công bố / form / job*.
+
+> **Phân mốc harness:** M1a bắt buộc `identity/admission/budgets/model_gateway/execution/events/errors` + `observability` (tối thiểu: trace + token/latency metric) + `safety` (injection‑hardening context) + `lifecycle` (health probe). `resilience` (breaker/fallback), `cache`, `feedback` nâng cấp ở M1b/M2 — nhưng để **chỗ cắm sẵn** từ đầu, không bolt‑on sau.
+
+---
+
+## 4.1 Guardrails, trust boundary & phân vai FE/BE ↔ RAG
+
+> Trả lời trực tiếp: *"FE/BE đã auth rồi thì RAG có cần auth nữa không?"* — và tổng quát hơn: cái gì làm ở FE/BE thì RAG khỏi làm.
+
+### Nguyên tắc ranh giới tin cậy (trust boundary)
+
+RAG là một **dịch vụ nội bộ sau BE**, không phơi thẳng ra Internet. Vì vậy tách đôi khái niệm:
+
+- **Authentication (bạn là ai)** — *việc của BE*. RAG **không** tự đăng nhập người dùng cuối (không quản mật khẩu/OAuth/session). RAG chỉ **tin BE** qua một trong: mTLS, service token ký (JWT nội bộ ngắn hạn), hoặc network isolation (chỉ BE gọi được). → **RAG không cần làm lại authentication.**
+- **Authorization/ownership (bạn được đụng tài nguyên nào)** — *RAG VẪN phải làm*, trên tài nguyên **do RAG sở hữu** (`execution_id`, `conversation_id`, `job_id`, evidence snapshot). BE truyền xuống một **principal đã xác thực** (claim ký, không phải client tự khai); RAG enforce ownership trên dữ liệu của chính nó. Lý do: nếu chỉ BE kiểm, một bug/đường vòng ở BE (hoặc dịch vụ nội bộ khác gọi RAG) sẽ đọc chéo conversation người khác.
+
+> **Kết luận auth:** RAG **nhận** principal đã xác thực từ BE (không re-authenticate), nhưng **tự enforce authorization + ownership** trên tài nguyên của mình. Đây là defense‑in‑depth, không phải trùng lặp.
+
+### Ma trận phân vai — ai sở hữu guardrail nào
+
+| Khía cạnh | FE | BE / API gateway | RAG service | Ghi chú |
+|---|---|---|---|---|
+| Authentication người dùng | nhập liệu | **OWNER** (session/OAuth) | nhận claim ký | RAG khỏi làm, chỉ verify chữ ký BE |
+| Authorization/ownership tài nguyên RAG | — | coarse (route) | **OWNER** (fine) | RAG kiểm trên `conversation/execution/job` của nó |
+| Rate-limit per user, WAF, bot/captcha, body-size, TLS | chặn sơ | **OWNER** | — | Chống DDoS "số đông" là của edge BE/gateway |
+| Rate-limit/concurrency **nội bộ** (chống một principal đốt LLM) | — | có thể | **OWNER** | BE không biết chi phí token; RAG phải tự cap |
+| **Budget/cost token** | — | — | **OWNER (chỉ RAG)** | Không uỷ quyền được: chỉ RAG biết chi phí mỗi call |
+| **Prompt injection từ context RAG/web** | — | — | **OWNER (chỉ RAG)** | Không ai ngoài RAG thấy context truy xuất |
+| **Groundedness / chống bịa dẫn chứng** | hiển thị | — | **OWNER (chỉ RAG)** | claim→evidence coverage |
+| **Idempotency side-effect của RAG** | gửi key | truyền key | **OWNER** | Tránh nhân đôi run/message |
+| Input validation | sơ bộ (UX) | có | **OWNER (tin cậy)** | FE validate chỉ cho UX; RAG **không tin** FE, validate lại |
+| Moderation nội dung độc hại | — | có thể | **nên có** | Có thể đặt ở BE; RAG vẫn nên moderation output |
+| PII redaction trước khi gửi LLM | — | tuỳ | **OWNER** | Chỉ RAG mới gọi provider ngoài |
+| Secret (API key LLM, DB pass) | — | — | **OWNER** | Qua broker ở biên executor |
+| SSRF (form crawl/fetch) | — | — | **OWNER** | Chỉ RAG fetch URL ngoài (M2) |
+| TLS, DDoS thể tích, audit đăng nhập | — | **OWNER** | — | Hạ tầng edge |
+
+**Quy tắc đọc ma trận:** cái gì **chỉ RAG nhìn thấy** (context truy xuất, chi phí token, dẫn chứng, secret LLM) thì **không uỷ quyền được** — bắt buộc làm ở RAG. Cái gì thuộc **biên public** (volumetric DDoS, WAF, TLS, captcha, authentication) để BE/gateway lo, RAG khỏi lặp. Riêng **validation & ownership** làm ở cả hai (RAG không tin input từ bất kỳ caller nào, kể cả BE).
+
+### Threat model — đe doạ → cơ chế → mốc → test
+
+| Đe doạ | Cơ chế chặn (ở RAG) | Mốc | Test |
+|---|---|---|---|
+| Flood/đốt tài nguyên nội bộ | Rate-limit + concurrency cap theo principal; **budget token/chi phí**; admission trước fan-out; body-size + request timeout | M1a | 1 principal spam → bị tiết lưu; vượt budget → `quota_exhausted` |
+| Prompt injection từ điều luật/web | `safety.py`: context bọc delimiter + chỉ thị "dữ liệu không phải lệnh"; bỏ `"assistant:"` giả; output chỉ gồm claim có evidence | M1a | câu hỏi nhúng "ignore instructions" trong context → model không tuân |
+| Bịa / vượt chứng cứ | claim→evidence coverage; assess không fail-open; abstention/partial + disclaimer | M1a | claim thiếu evidence → hạ bậc, không xuất |
+| Đọc chéo tài nguyên | principal ký từ BE + ownership guard trên `conversation/execution/job` | M1a | principal A đọc execution của B → 403 |
+| Lộ nội bộ | hợp đồng lỗi mã công khai; redaction SSE/log; không StaticFiles tài liệu riêng | M1a | lỗi provider/path/Cypher không ra ngoài |
+| Provider chết kéo sập | `resilience.py`: circuit breaker + fallback model chain | M1b | Infinity/LLM down → breaker mở, lỗi có kiểu, không treo |
+| Nội dung độc hại / jailbreak | moderation input/output | M1b | payload độc → bị chặn/được gắn cờ |
+| PII rò sang provider | redaction trước egress | M1b | email/định danh người dùng không lọt vào payload LLM |
+| SSRF qua form crawl | allowlist scheme/host, chặn IP nội bộ/metadata | M2 | fetch `169.254.169.254`/`localhost` → từ chối |
+
+### Bổ sung DoD M1a (tối thiểu, không trì hoãn được)
+- [ ] RAG verify principal ký từ BE (mTLS/JWT nội bộ) + enforce ownership trên tài nguyên của mình (không re-authenticate người dùng cuối).
+- [ ] Rate-limit/concurrency theo principal + budget token ở edge RAG (chống đốt nội bộ dù BE đã có WAF).
+- [ ] Injection-hardening context RAG/web trong GENERATE/ASSESS (mở rộng từ LAWYER_SUMMARY).
+- [ ] Observability tối thiểu: trace span + token/latency/retrieval-status metric; health probe gồm G-DB schema contract.
 
 ---
 
